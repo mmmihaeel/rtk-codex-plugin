@@ -1,0 +1,20 @@
+{
+  "name": "rtk-codex-plugin",
+  "version": "0.1.0",
+  "description": "RTK PreToolUse command rewrite and bounded-output hook for Codex-compatible shell tools.",
+  "author": {
+    "name": "RTK Codex Plugin Maintainers"
+  },
+  "license": "MIT",
+  "keywords": ["rtk", "codex", "hooks", "token-safety"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "RTK Codex Plugin",
+    "shortDescription": "Routes Codex shell commands through RTK and guards risky output.",
+    "longDescription": "Uses Codex PreToolUse hooks to rewrite eligible shell commands through RTK while preserving exact output commands and capping risky long-line inspection output.",
+    "developerName": "RTK Codex Plugin Maintainers",
+    "category": "Developer Tools",
+    "capabilities": ["Hooks", "Shell"]
+  }
+}

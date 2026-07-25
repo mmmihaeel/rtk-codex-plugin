@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Run an inspection shell command with bounded line and total output size."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as _dt
+import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+DEFAULT_MAX_LINE_BYTES = 4096
+DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
+MAX_SUPPRESSED_LINE_BYTES = 1024 * 1024
+READ_SIZE = 8192
+
+
+class OutputState:
+    def __init__(self, max_output_bytes: int) -> None:
+        self.max_output_bytes = max_output_bytes
+        self.output_bytes = 0
+        self.total_truncated = False
+
+    def emit(self, data: bytes) -> bool:
+        if not data or self.total_truncated:
+            return not self.total_truncated
+
+        remaining = self.max_output_bytes - self.output_bytes
+        if remaining <= 0:
+            self.total_truncated = True
+            return False
+
+        if len(data) > remaining:
+            sys.stdout.buffer.write(data[:remaining])
+            self.output_bytes += remaining
+            self.total_truncated = True
+            return False
+
+        sys.stdout.buffer.write(data)
+        self.output_bytes += len(data)
+        return True
+
+
+class ArtifactState:
+    def __init__(self) -> None:
+        self.path: Path | None = None
+        self.handle = None
+        self.sha256 = hashlib.sha256()
+        self.bytes = 0
+        self.lines = 0
+        self._last_byte_newline = True
+
+    def open(self) -> None:
+        if self.handle is not None:
+            return
+        root = artifact_root()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            root.chmod(0o700)
+        except OSError:
+            pass
+        stamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        self.path = root / f"{stamp}-pretool-output.tmp"
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        self.handle = os.fdopen(fd, "wb")
+
+    def write(self, data: bytes) -> None:
+        if not data:
+            return
+        self.open()
+        assert self.handle is not None
+        self.handle.write(data)
+        self.sha256.update(data)
+        self.bytes += len(data)
+        self.lines += data.count(b"\n")
+        self._last_byte_newline = data.endswith(b"\n")
+
+    def finish(self, keep: bool) -> tuple[Path | None, str | None, int, int]:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+        digest = self.sha256.hexdigest() if self.bytes else None
+        line_count = self.lines + (1 if self.bytes and not self._last_byte_newline else 0)
+        if not self.path:
+            return None, digest, self.bytes, line_count
+        if not keep:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            return None, digest, self.bytes, line_count
+        final_path = self.path.with_name(f"{self.path.stem}-{(digest or 'empty')[:12]}.txt")
+        try:
+            self.path.replace(final_path)
+            self.path = final_path
+        except OSError:
+            final_path = self.path
+        try:
+            final_path.chmod(0o600)
+        except OSError:
+            pass
+        return final_path, digest, self.bytes, line_count
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--b64", required=True, help="base64-encoded shell command")
+    parser.add_argument("--max-line-bytes", type=int, default=DEFAULT_MAX_LINE_BYTES)
+    parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
+    return parser.parse_args()
+
+
+def artifact_root() -> Path:
+    override = os.environ.get("RTK_CODEX_ARTIFACT_DIR")
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home).expanduser() / "rtk-codex-plugin" / "artifacts" / "pretool"
+    return Path.home() / ".local" / "state" / "rtk-codex-plugin" / "artifacts" / "pretool"
+
+
+def decode_command(encoded: str) -> str:
+    return base64.b64decode(encoded.encode("ascii"), validate=True).decode("utf8")
+
+
+def stream_bounded(process: subprocess.Popen[bytes], max_line_bytes: int, max_output_bytes: int) -> tuple[bool, ArtifactState]:
+    assert process.stdout is not None
+
+    state = OutputState(max_output_bytes)
+    artifact = ArtifactState()
+    line_bytes = 0
+    line_truncated = False
+    truncated = False
+
+    while True:
+        chunk = process.stdout.read(READ_SIZE)
+        if not chunk:
+            break
+        artifact.write(chunk)
+
+        for byte in chunk:
+            if byte == 10:
+                if not line_truncated and not state.emit(b"\n"):
+                    truncated = True
+                line_bytes = 0
+                line_truncated = False
+                continue
+
+            line_bytes += 1
+            if line_bytes <= max_line_bytes and not line_truncated:
+                if not state.emit(bytes((byte,))):
+                    truncated = True
+                continue
+
+            if not line_truncated:
+                if state.emit(b"... [rtk-output-guard: line truncated]\n"):
+                    truncated = True
+                line_truncated = True
+
+            if line_bytes > max_line_bytes + MAX_SUPPRESSED_LINE_BYTES:
+                truncated = True
+
+    if truncated or state.total_truncated:
+        if state.total_truncated:
+            sys.stdout.buffer.write(
+                f"\n[rtk-output-guard: output truncated after {max_output_bytes} bytes]\n".encode(
+                    "ascii"
+                )
+            )
+        else:
+            sys.stdout.buffer.write(
+                b"\n[rtk-output-guard: oversized line compacted]\n"
+            )
+        return True, artifact
+
+    return False, artifact
+
+
+def terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=1)
+
+
+def main() -> int:
+    args = parse_args()
+    max_line_bytes = max(128, args.max_line_bytes)
+    max_output_bytes = max(max_line_bytes, args.max_output_bytes)
+
+    try:
+        command = decode_command(args.b64)
+    except Exception as exc:
+        print(f"rtk-output-guard: invalid command: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as exc:
+        print(f"rtk-output-guard: failed to start command: {exc}", file=sys.stderr)
+        return 126
+
+    truncated, artifact = stream_bounded(process, max_line_bytes, max_output_bytes)
+    if truncated:
+        exit_code = process.wait()
+        artifact_path, digest, raw_bytes, raw_lines = artifact.finish(keep=True)
+        if artifact_path:
+            sys.stdout.buffer.write(
+                (
+                    f"[rtk-output-guard: full raw output artifact={artifact_path} "
+                    f"bytes={raw_bytes} lines={raw_lines} sha256={digest}]\n"
+                ).encode("utf8")
+            )
+        return exit_code
+
+    artifact.finish(keep=False)
+    return process.wait()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

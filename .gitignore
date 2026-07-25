@@ -1,0 +1,33 @@
+# Local operator surfaces
+AGENTS.md
+AGENTS.local.md
+.agents/
+runtime.env
+
+# Local runtime and developer surfaces
+.env
+.env.*
+*.local
+.local/
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local outputs
+*.log
+logs/
+tmp/
+.cache/
+artifacts/
+reports/
+screenshots/
+playwright-report/
+
+# Common dependency / build outputs
+target/
+node_modules/
+dist/
+coverage/
+public-dist/

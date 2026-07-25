@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""Codex PostToolUse hook that compacts large shell tool output into artifacts."""
+
+from __future__ import annotations
+
+import datetime as _dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+from typing import Any
+
+
+BYPASS_ENV = {
+    "RTK_CODEX_HOOK_DISABLE",
+    "RTK_CODEX_BYPASS",
+    "RTK_DISABLE",
+    "RTK_DISABLED",
+}
+DEFAULT_SINGLE_VISIBLE_BYTES = 12 * 1024
+DEFAULT_HUMAN_VISIBLE_BYTES = 5 * 1024
+DEFAULT_AGGREGATE_VISIBLE_BYTES = 32 * 1024
+DEFAULT_LINE_CAP = 300
+DEFAULT_HEAD_BYTES = 4096
+DEFAULT_TAIL_BYTES = 2048
+STREAM_BYPASS_MARKER_SCHEMA = 1
+MACHINE_FLAGS = {
+    "--json",
+    "--format=json",
+    "--porcelain",
+    "--porcelain=v1",
+    "--porcelain=v2",
+    "--machine-readable",
+    "-json",
+}
+MACHINE_VALUE_FLAGS = {"--format", "--output", "-o"}
+MACHINE_VALUES = {"json", "jsonpath", "machine-readable", "porcelain", "yaml", "yml"}
+HUMAN_OUTPUT_COMMANDS = {
+    "bat",
+    "cat",
+    "fd",
+    "find",
+    "git",
+    "grep",
+    "head",
+    "jq",
+    "ls",
+    "nl",
+    "rg",
+    "sed",
+    "tail",
+    "tree",
+}
+BUILD_TEST_COMMANDS = {
+    "cargo",
+    "gradle",
+    "gradlew",
+    "go",
+    "jest",
+    "make",
+    "mvn",
+    "mvnw",
+    "npm",
+    "pnpm",
+    "pytest",
+    "rake",
+    "rspec",
+    "vitest",
+    "yarn",
+}
+LIVE_OUTPUT_COMMANDS = {
+    "docker",
+    "docker-compose",
+    "podman",
+    "ssh",
+}
+WRAPPER_COMMANDS = {
+    "chronic",
+    "command",
+    "ionice",
+    "nice",
+    "stdbuf",
+    "sudo",
+    "time",
+    "timeout",
+}
+CONTROL_MARKERS = ("|", ">", "<", "$(", "`", "&&", "||", ";", "\n", "\r", "&")
+SHELL_RUNNERS = {"bash", "dash", "sh", "zsh"}
+WRITE_STDIN_TOOL_NAMES = {"write_stdin", "functions.write_stdin"}
+PARALLEL_TOOL_NAMES = {"multi_tool_use.parallel"}
+COMMAND_PREVIEW_BYTES = 512
+
+
+def enabled(value: str | None) -> bool:
+    return value is not None and value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def safe_name(value: Any, fallback: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip()).strip("-")
+    return normalized[:96] or fallback
+
+
+def command_from_payload(payload: dict[str, Any]) -> str:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("command", "cmd"):
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def is_write_stdin_payload(payload: dict[str, Any]) -> bool:
+    tool_name = payload.get("tool_name")
+    return isinstance(tool_name, str) and (
+        tool_name in WRITE_STDIN_TOOL_NAMES or tool_name.endswith(".write_stdin")
+    )
+
+
+def is_parallel_payload(payload: dict[str, Any]) -> bool:
+    tool_name = payload.get("tool_name")
+    return isinstance(tool_name, str) and (
+        tool_name in PARALLEL_TOOL_NAMES or tool_name.endswith(".parallel")
+    )
+
+
+def write_stdin_label(payload: dict[str, Any]) -> str:
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        for key in ("session_id", "pty_id", "process_id"):
+            value = tool_input.get(key)
+            if value is not None:
+                return f"write_stdin {key}={safe_name(value, 'unknown')}"
+    return "write_stdin stream"
+
+
+def write_stdin_stream_id(payload: dict[str, Any]) -> str:
+    tool_input = payload.get("tool_input")
+    return stream_id_from_value(tool_input)
+
+
+def stream_id_from_value(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("session_id", "pty_id", "process_id"):
+            stream_value = value.get(key)
+            if stream_value is not None:
+                return f"{key}:{safe_name(stream_value, 'unknown')}"
+        for key in ("session", "pty", "process"):
+            stream_value = value.get(key)
+            if isinstance(stream_value, dict):
+                nested = stream_id_from_value(stream_value)
+                if nested:
+                    return nested
+    if isinstance(value, str):
+        for key, pattern in (
+            ("session_id", r"\bsession ID\s+([A-Za-z0-9_.:-]+)"),
+            ("session_id", r"\bsession_id[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_.:-]+)"),
+            ("pty_id", r"\bpty_id[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_.:-]+)"),
+            ("process_id", r"\bprocess_id[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_.:-]+)"),
+        ):
+            match = re.search(pattern, value)
+            if match:
+                return f"{key}:{safe_name(match.group(1), 'unknown')}"
+    return ""
+
+
+def response_stream_id(payload: dict[str, Any]) -> str:
+    return stream_id_from_value(payload.get("tool_response"))
+
+
+def stream_bypass_marker_path(payload: dict[str, Any], stream_id: str) -> Path:
+    session = safe_name(payload.get("session_id"), "session")
+    digest = hashlib.sha256(stream_id.encode("utf8", errors="replace")).hexdigest()[:16]
+    return budget_root() / "stream-bypass" / session / f"{digest}.json"
+
+
+def write_stream_bypass_marker(payload: dict[str, Any], stream_id: str) -> None:
+    if not stream_id:
+        return
+    path = stream_bypass_marker_path(payload, stream_id)
+    data = {
+        "schema_version": STREAM_BYPASS_MARKER_SCHEMA,
+        "session_id": payload.get("session_id"),
+        "stream_id": stream_id,
+        "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text(json.dumps(data, separators=(",", ":")) + "\n", encoding="utf8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError:
+        return
+
+
+def has_stream_bypass_marker(payload: dict[str, Any], stream_id: str) -> bool:
+    if not stream_id:
+        return False
+    path = stream_bypass_marker_path(payload, stream_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf8"))
+    except Exception:
+        return False
+    return bool(
+        data.get("schema_version") == STREAM_BYPASS_MARKER_SCHEMA
+        and data.get("session_id") == payload.get("session_id")
+        and data.get("stream_id") == stream_id
+    )
+
+
+def parallel_commands(payload: dict[str, Any]) -> tuple[list[str], int]:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return [], 0
+    tool_uses = tool_input.get("tool_uses")
+    if not isinstance(tool_uses, list):
+        return [], 0
+    commands: list[str] = []
+    for tool_use in tool_uses:
+        if not isinstance(tool_use, dict):
+            continue
+        if not is_parallel_exec_command_child(tool_use):
+            continue
+        parameters = tool_use.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        for key in ("command", "cmd"):
+            value = parameters.get(key)
+            if isinstance(value, str) and value.strip():
+                commands.append(value)
+                break
+    return commands, len(tool_uses)
+
+
+def is_parallel_exec_command_child(tool_use: dict[str, Any]) -> bool:
+    recipient = tool_use.get("recipient_name")
+    return recipient in {"exec_command", "functions.exec_command"}
+
+
+def parallel_has_explicit_exact_output_bypass(payload: dict[str, Any]) -> bool:
+    commands, child_count = parallel_commands(payload)
+    return bool(
+        commands
+        and child_count == len(commands)
+        and all(has_explicit_exact_output_bypass(command) for command in commands)
+    )
+
+
+def safe_unwrap_shell_command(command: str) -> str:
+    try:
+        tokens = shlex.split(command.strip(), posix=True)
+    except ValueError:
+        return command
+    if len(tokens) != 3:
+        return command
+    runner = os.path.basename(tokens[0])
+    if runner not in SHELL_RUNNERS or tokens[1] not in {"-c", "-lc"}:
+        return command
+    inner = tokens[2].strip()
+    return inner or command
+
+
+def strip_env_prefix(tokens: list[str]) -> list[str]:
+    if not tokens:
+        return tokens
+    if is_env_assignment(tokens[0]):
+        index = 0
+        while index < len(tokens) and is_env_assignment(tokens[index]):
+            index += 1
+        return tokens[index:] if index < len(tokens) else tokens
+    if tokens[0] != "env":
+        return tokens
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-i", "--ignore-environment", "--"}:
+            index += 1
+            continue
+        if token in {"-u", "--unset"} and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token.startswith("-u") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("--unset="):
+            index += 1
+            continue
+        if token in {"-C", "--chdir"} and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token.startswith("-C") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("--chdir="):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return tokens
+        if is_env_assignment(token):
+            index += 1
+            continue
+        break
+    return tokens[index:] if index < len(tokens) else tokens
+
+
+def is_env_assignment(token: str) -> bool:
+    name, separator, _value = token.partition("=")
+    return bool(separator and name)
+
+
+def has_bypass_env_prefix(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    if is_env_assignment(tokens[0]):
+        for token in tokens:
+            if not is_env_assignment(token):
+                break
+            if is_bypass_assignment(token):
+                return True
+        return False
+    if tokens[0] != "env":
+        return False
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-i", "--ignore-environment"}:
+            index += 1
+            continue
+        if token == "--":
+            index += 1
+            continue
+        if token in {"-u", "--unset"} and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token.startswith("-u") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("--unset="):
+            index += 1
+            continue
+        if token in {"-C", "--chdir"} and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token.startswith("-C") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("--chdir="):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return False
+        if is_env_assignment(token):
+            if is_bypass_assignment(token):
+                return True
+            index += 1
+            continue
+        break
+    return False
+
+
+def is_bypass_assignment(token: str) -> bool:
+    name, separator, value = token.partition("=")
+    return bool(separator and value and name in BYPASS_ENV)
+
+
+def has_bypass_env_prefix_deep(tokens: list[str]) -> bool:
+    current = tokens
+    for _ in range(8):
+        if has_bypass_env_prefix(current):
+            return True
+        stripped = strip_env_prefix(current)
+        if stripped != current:
+            current = stripped
+            continue
+        wrapped = wrapper_inner_tokens(os.path.basename(current[0]), current) if current else current
+        if wrapped == current:
+            return False
+        current = wrapped
+    return False
+
+
+def is_machine_flag(token: str) -> bool:
+    if token in MACHINE_FLAGS:
+        return True
+    if re.match(r"^--[^=]+=(json|yaml|yml)$", token):
+        return True
+    return bool(re.match(r"^-o=?(json|yaml|yml|jsonpath)(=.*)?$", token))
+
+
+def has_machine_output_request(tokens: list[str]) -> bool:
+    if any(is_machine_flag(token) for token in tokens):
+        return True
+    for index, token in enumerate(tokens[:-1]):
+        if token in MACHINE_VALUE_FLAGS:
+            value = tokens[index + 1].lower()
+            if value in MACHINE_VALUES or value.startswith("jsonpath="):
+                return True
+    return False
+
+
+def has_explicit_exact_output_bypass(command: str) -> bool:
+    stripped = command.strip()
+    if not stripped:
+        return False
+    stripped = safe_unwrap_shell_command(stripped)
+    try:
+        tokens = shlex.split(stripped, posix=True)
+    except ValueError:
+        return False
+    if not tokens or has_bypass_env_prefix_deep(tokens):
+        return True
+    return False
+
+
+def is_human_output_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command.strip(), posix=True)
+    except ValueError:
+        return False
+    tokens = normalized_command_tokens(tokens)
+    if not tokens:
+        return False
+    head = os.path.basename(tokens[0])
+    return head in HUMAN_OUTPUT_COMMANDS or head in BUILD_TEST_COMMANDS or head in LIVE_OUTPUT_COMMANDS or any(
+        marker in command for marker in CONTROL_MARKERS
+    )
+
+
+def normalized_command_tokens(tokens: list[str]) -> list[str]:
+    current = tokens
+    for _ in range(8):
+        stripped = strip_env_prefix(current)
+        if stripped != current:
+            current = stripped
+            continue
+        head = os.path.basename(current[0]) if current else ""
+        inner = wrapper_inner_tokens(head, current)
+        if inner == current:
+            return current
+        current = inner
+    return current
+
+
+def wrapper_inner_tokens(head: str, tokens: list[str]) -> list[str]:
+    if head not in WRAPPER_COMMANDS:
+        return tokens
+    if head == "command":
+        index = 1
+        while index < len(tokens) and tokens[index] in {"-p", "--"}:
+            index += 1
+        if index < len(tokens) and tokens[index] not in {"-v", "-V"}:
+            return tokens[index:]
+        return tokens
+    if head == "chronic":
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            index += 1
+        return tokens[index:] if index < len(tokens) else tokens
+    if head == "time":
+        index = skip_time_options(tokens, 1)
+        return tokens[index:] if index < len(tokens) else tokens
+    if head == "timeout":
+        index = skip_timeout_options(tokens, 1)
+        return tokens[index:] if index < len(tokens) else tokens
+    if head == "sudo":
+        index = skip_sudo_options(tokens, 1)
+        return tokens[index:] if index < len(tokens) else tokens
+    if head in {"nice", "ionice", "stdbuf"}:
+        index = 1
+        value_flags = {
+            "-n",
+            "--adjustment",
+            "-c",
+            "--class",
+            "-p",
+            "--pid",
+            "-o",
+            "-e",
+            "-i",
+            "--output",
+            "--error",
+            "--input",
+        }
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                index += 1
+                break
+            if token in value_flags and index + 1 < len(tokens):
+                index += 2
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            break
+        return tokens[index:] if index < len(tokens) else tokens
+    return tokens
+
+
+def skip_timeout_options(tokens: list[str], index: int) -> int:
+    value_flags = {"-s", "--signal", "-k", "--kill-after"}
+    no_value_flags = {"--foreground", "--preserve-status", "--verbose"}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in value_flags and index + 1 < len(tokens):
+            index += 2
+            continue
+        if any(token.startswith(f"{flag}=") for flag in {"--signal", "--kill-after"}):
+            index += 1
+            continue
+        if token.startswith("-s") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("-k") and len(token) > 2:
+            index += 1
+            continue
+        if token in no_value_flags:
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        index += 1
+        break
+    return index
+
+
+def skip_sudo_options(tokens: list[str], index: int) -> int:
+    value_flags = {"-C", "-g", "-h", "-p", "-T", "-t", "-U", "-u"}
+    long_value_flags = {
+        "--close-from",
+        "--chdir",
+        "--group",
+        "--host",
+        "--login-class",
+        "--prompt",
+        "--role",
+        "--type",
+        "--user",
+    }
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in value_flags and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token in long_value_flags and index + 1 < len(tokens):
+            index += 2
+            continue
+        if any(token.startswith(f"{flag}=") for flag in long_value_flags):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+    return index
+
+
+def skip_time_options(tokens: list[str], index: int) -> int:
+    value_flags = {"-f", "--format", "-o", "--output"}
+    no_value_flags = {"-a", "--append", "-p", "--portability", "-v", "--verbose", "--quiet"}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in value_flags and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token.startswith("-f") and token != "-f":
+            index += 1
+            continue
+        if token.startswith("-o") and token != "-o":
+            index += 1
+            continue
+        if any(token.startswith(f"{flag}=") for flag in {"--format", "--output"}):
+            index += 1
+            continue
+        if token in no_value_flags:
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+    return index
+
+
+def command_class(command: str) -> str:
+    if any(marker in command for marker in CONTROL_MARKERS):
+        return "shell-control-or-pipeline"
+    try:
+        tokens = shlex.split(command.strip(), posix=True)
+    except ValueError:
+        return "unparseable"
+    tokens = normalized_command_tokens(tokens)
+    if not tokens:
+        return "unknown"
+    head = os.path.basename(tokens[0])
+    if head in {"docker", "docker-compose", "podman"}:
+        if is_container_log_or_dump(tokens):
+            return "container-log-or-dump"
+        return "container-control"
+    if head == "ssh":
+        return "ssh-remote-output"
+    if head == "jq":
+        return "structured-json"
+    if head in {"rg", "grep"}:
+        return "search-output"
+    if head == "git":
+        return "git-output"
+    if head in BUILD_TEST_COMMANDS:
+        return "build-or-test-output"
+    if head in HUMAN_OUTPUT_COMMANDS:
+        return "human-facing-output"
+    if has_machine_output_request(tokens):
+        return "machine-readable-output"
+    return head or "unknown"
+
+
+def is_container_log_or_dump(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    head = os.path.basename(tokens[0])
+    tail = tokens[1:]
+    if head in {"docker", "podman"} and tail[:1] in (["logs"], ["exec"]):
+        return True
+    if head == "docker" and len(tail) >= 2 and tail[:2] == ["compose", "logs"]:
+        return True
+    if head == "docker-compose" and tail[:1] == ["logs"]:
+        return True
+    return False
+
+
+def artifact_root() -> Path:
+    override = os.environ.get("RTK_CODEX_ARTIFACT_DIR")
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home).expanduser() / "rtk-codex-plugin" / "artifacts"
+    return Path.home() / ".local" / "state" / "rtk-codex-plugin" / "artifacts"
+
+
+def budget_root() -> Path:
+    override = os.environ.get("RTK_CODEX_BUDGET_DIR")
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home).expanduser() / "rtk-codex-plugin" / "budgets"
+    return Path.home() / ".local" / "state" / "rtk-codex-plugin" / "budgets"
+
+
+def write_artifact(payload: dict[str, Any], text: str) -> tuple[Path, str]:
+    digest = hashlib.sha256(text.encode("utf8", errors="replace")).hexdigest()
+    session = safe_name(payload.get("session_id"), "session")
+    turn = safe_name(payload.get("turn_id"), "turn")
+    tool_use = safe_name(payload.get("tool_use_id"), "tool")
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    directory = artifact_root() / session / turn
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    path = directory / f"{stamp}-{tool_use}-{digest[:12]}.txt"
+    path.write_text(text, encoding="utf8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path, digest
+
+
+def remove_artifact(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        return
+    for directory in (path.parent, path.parent.parent):
+        try:
+            directory.rmdir()
+        except OSError:
+            return
+
+
+def reserve_turn_budget(payload: dict[str, Any], visible_bytes: int, aggregate_budget: int) -> bool:
+    if aggregate_budget <= 0:
+        return False
+    session = safe_name(payload.get("session_id"), "session")
+    turn = safe_name(payload.get("turn_id"), "turn")
+    directory = budget_root()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    path = directory / f"{session}-{turn}.json"
+    lock_path = directory / f"{session}-{turn}.lock"
+    try:
+        with lock_path.open("w", encoding="utf8") as lock_file:
+            try:
+                lock_path.chmod(0o600)
+            except OSError:
+                pass
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                state = json.loads(path.read_text(encoding="utf8"))
+            except Exception:
+                state = {}
+            used = int(state.get("visible_bytes") or 0)
+            exceeded = used + visible_bytes > aggregate_budget
+            state.update({
+                "schema_version": 1,
+                "session_id": payload.get("session_id"),
+                "turn_id": payload.get("turn_id"),
+                "visible_bytes": used + visible_bytes,
+                "aggregate_budget_bytes": aggregate_budget,
+                "updated_at": _dt.datetime.now(_dt.UTC).isoformat(),
+            })
+            path.write_text(json.dumps(state, separators=(",", ":")) + "\n", encoding="utf8")
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return exceeded
+    except Exception:
+        return False
+
+
+def turn_budget_would_exceed(payload: dict[str, Any], visible_bytes: int, aggregate_budget: int) -> bool:
+    if aggregate_budget <= 0:
+        return False
+    session = safe_name(payload.get("session_id"), "session")
+    turn = safe_name(payload.get("turn_id"), "turn")
+    path = budget_root() / f"{session}-{turn}.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf8"))
+    except Exception:
+        state = {}
+    used = int(state.get("visible_bytes") or 0)
+    return used + visible_bytes > aggregate_budget
+
+
+def byte_excerpt(text: str, head_bytes: int, tail_bytes: int) -> tuple[str, int]:
+    encoded = text.encode("utf8", errors="replace")
+    if len(encoded) <= head_bytes + tail_bytes:
+        return text, 0
+    head = encoded[:head_bytes].decode("utf8", errors="replace")
+    tail = encoded[-tail_bytes:].decode("utf8", errors="replace")
+    omitted = len(encoded) - head_bytes - tail_bytes
+    return f"{head}\n\n... [rtk-output-guard: omitted {omitted} bytes] ...\n\n{tail}", omitted
+
+
+def truncate_bytes(text: str, limit: int) -> str:
+    encoded = text.encode("utf8", errors="replace")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf8", errors="replace") + "... [truncated]"
+
+
+def count_lines(text: str) -> int:
+    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+
+
+def summary_is_smaller(summary: str, raw_bytes: int) -> bool:
+    summary_bytes = len(summary.encode("utf8", errors="replace"))
+    if summary_bytes >= raw_bytes:
+        return False
+    return raw_bytes - summary_bytes >= 512 or summary_bytes <= int(raw_bytes * 0.9)
+
+
+def compose_summary(
+    summary_input: dict[str, Any],
+    *,
+    head_bytes: int,
+    tail_bytes: int,
+    excerpt_label: str,
+) -> str:
+    payload = summary_input["payload"]
+    command = summary_input["command"]
+    response = summary_input["response"]
+    artifact_path = summary_input["artifact_path"]
+    digest = summary_input["digest"]
+    reason = summary_input["reason"]
+    line_count = summary_input["line_count"]
+    byte_count = summary_input["byte_count"]
+    klass = command_class(command)
+    if head_bytes > 0 or tail_bytes > 0:
+        excerpt, _omitted_bytes = byte_excerpt(response, head_bytes, tail_bytes)
+    else:
+        excerpt = ""
+    excerpt_bytes = len(excerpt.encode("utf8", errors="replace"))
+    excerpt_lines = count_lines(excerpt)
+    hidden_lines = max(line_count - excerpt_lines, 0)
+    hidden_bytes = max(byte_count - excerpt_bytes, 0)
+    lines = [
+        "[rtk-output-guard: output compacted]",
+        f"tool: {payload.get('tool_name') or 'unknown'}",
+        f"class: {klass}",
+        f"reason: {reason}",
+        f"command: {truncate_bytes(command, COMMAND_PREVIEW_BYTES)}",
+        f"original_bytes: {byte_count}",
+        f"original_lines: {line_count}",
+        f"visible_excerpt_bytes: {excerpt_bytes}",
+        f"visible_excerpt_lines: {excerpt_lines}",
+        f"hidden_bytes: {hidden_bytes}",
+        f"hidden_lines: {hidden_lines}",
+        f"artifact: {artifact_path}",
+        f"sha256: {digest}",
+        "artifact_completeness: full output available to RTK PostToolUse; upstream runtime truncation unknown.",
+        "exact_output: set RTK_CODEX_BYPASS=1 for the command/session when raw model-visible output is required.",
+    ]
+    if excerpt:
+        lines.extend([
+            f"excerpt: {excerpt_label}",
+            "----- rtk-output-head-tail -----",
+            excerpt,
+            "----- end -----",
+        ])
+    else:
+        lines.append("excerpt: omitted so compact summary stays smaller than raw output.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_summary(summary_input: dict[str, Any]) -> str:
+    response = summary_input["response"]
+    byte_count = summary_input["byte_count"]
+    head_bytes = int_env("RTK_CODEX_SUMMARY_HEAD_BYTES", DEFAULT_HEAD_BYTES, 512, 32 * 1024)
+    tail_bytes = int_env("RTK_CODEX_SUMMARY_TAIL_BYTES", DEFAULT_TAIL_BYTES, 256, 32 * 1024)
+    candidates = [
+        compose_summary(summary_input, head_bytes=head_bytes, tail_bytes=tail_bytes, excerpt_label="default"),
+        compose_summary(summary_input, head_bytes=1024, tail_bytes=512, excerpt_label="small"),
+        compose_summary(summary_input, head_bytes=0, tail_bytes=0, excerpt_label="none"),
+    ]
+    for candidate in candidates:
+        if summary_is_smaller(candidate, byte_count):
+            return candidate
+    return candidates[-1]
+
+
+def main() -> int:
+    if any(enabled(os.environ.get(name)) for name in BYPASS_ENV):
+        return 0
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+    if payload.get("hook_event_name") != "PostToolUse":
+        return 0
+    response = payload.get("tool_response")
+    if not isinstance(response, str) or not response:
+        return 0
+
+    command = safe_unwrap_shell_command(command_from_payload(payload))
+    write_stdin_output = is_write_stdin_payload(payload)
+    parallel_output = is_parallel_payload(payload)
+    stream_id = write_stdin_stream_id(payload) if write_stdin_output else ""
+    if write_stdin_output and not command:
+        command = write_stdin_label(payload)
+    if parallel_output and not command:
+        command = str(payload.get("tool_name") or "multi_tool_use.parallel")
+    if write_stdin_output and has_explicit_exact_output_bypass(command):
+        write_stream_bypass_marker(payload, stream_id)
+        return 0
+    if write_stdin_output and has_stream_bypass_marker(payload, stream_id):
+        return 0
+    if parallel_output and parallel_has_explicit_exact_output_bypass(payload):
+        return 0
+    if not write_stdin_output and not parallel_output and has_explicit_exact_output_bypass(command):
+        write_stream_bypass_marker(payload, response_stream_id(payload))
+        return 0
+
+    byte_count = len(response.encode("utf8", errors="replace"))
+    line_count = count_lines(response)
+    single_cap = int_env("RTK_CODEX_VISIBLE_OUTPUT_BYTES", DEFAULT_SINGLE_VISIBLE_BYTES, 1024, 1024 * 1024)
+    human_cap = int_env("RTK_CODEX_HUMAN_OUTPUT_BYTES", DEFAULT_HUMAN_VISIBLE_BYTES, 1024, 1024 * 1024)
+    line_cap = int_env("RTK_CODEX_VISIBLE_OUTPUT_LINES", DEFAULT_LINE_CAP, 20, 10000)
+    aggregate_cap = int_env(
+        "RTK_CODEX_AGGREGATE_VISIBLE_OUTPUT_BYTES",
+        DEFAULT_AGGREGATE_VISIBLE_BYTES,
+        0,
+        4 * 1024 * 1024,
+    )
+    human_output = write_stdin_output or parallel_output or is_human_output_command(command)
+    reason = ""
+    if human_output and byte_count > human_cap:
+        reason = f"medium-large human-facing output exceeded {human_cap} bytes"
+    elif byte_count > single_cap:
+        reason = f"single tool output exceeded {single_cap} bytes"
+    elif line_count > line_cap:
+        reason = f"tool output exceeded {line_cap} visible lines"
+    elif turn_budget_would_exceed(payload, byte_count, aggregate_cap):
+        reason = f"turn aggregate visible output budget exceeded {aggregate_cap} bytes"
+
+    if not reason:
+        reserve_turn_budget(payload, byte_count, aggregate_cap)
+        return 0
+
+    artifact_path, digest = write_artifact(payload, response)
+    summary = build_summary({
+        "payload": payload,
+        "command": command or str(payload.get("tool_name") or "write_stdin"),
+        "response": response,
+        "artifact_path": artifact_path,
+        "digest": digest,
+        "reason": reason,
+        "line_count": line_count,
+        "byte_count": byte_count,
+    })
+    if not summary_is_smaller(summary, byte_count):
+        remove_artifact(artifact_path)
+        return 0
+    reserve_turn_budget(payload, len(summary.encode("utf8", errors="replace")), aggregate_cap)
+    print(summary, end="", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

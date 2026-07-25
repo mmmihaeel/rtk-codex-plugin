@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|exec_command|functions\\.exec_command)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/hooks/rtk-codex-hook",
+            "timeout": 5,
+            "statusMessage": "RTK command rewrite"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+      "matcher": "^(Bash|exec_command|functions\\.exec_command|write_stdin|functions\\.write_stdin|multi_tool_use\\.parallel)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/hooks/rtk-output-post-hook",
+            "timeout": 8,
+            "statusMessage": "RTK output budget guard"
+          }
+        ]
+      }
+    ]
+  }
+}
