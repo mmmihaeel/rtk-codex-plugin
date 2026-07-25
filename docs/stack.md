@@ -1,39 +1,55 @@
 # Stack Fit
 
-`rtk-codex-plugin` is useful as a standalone Codex-compatible plugin, but it is
-also designed to sit in a larger local-agent stack.
+RTK Codex Plugin is an optional edge component in the Codez ecosystem. It owns
+shell request classification and model-visible output budgeting; it does not
+own the runtime, gateway, or indexed navigation service.
 
-## Part of the Codez stack
+```mermaid
+flowchart TB
+  accTitle: RTK Codex Plugin ecosystem position
+  accDescr: Codez can load RTK and Pitlane as optional local plugins. Teledex may drive Codez as an external gateway. RTK has no dependency on the gateway or the Pitlane plugin.
 
-The Codez stack is modular. Each layer can be used on its own unless a higher
-layer explicitly opts into it.
+  Teledex["Teledex<br/>optional gateway"] -. "JSON-RPC client" .-> Codez["Codez<br/>agent runtime"]
+  RTK["RTK Codex Plugin<br/>rewrite and output budgets"] -. "optional hooks" .-> Codez
+  Pitlane["Pitlane Codex Plugin<br/>indexed navigation rewrites"] -. "optional hooks" .-> Codez
+  RTK -. "optional local executable contract" .-> RTKCLI["rtk CLI"]
+```
 
-| Layer | Public surface | Responsibility | Dependency |
-| --- | --- | --- | --- |
-| [Codez](https://github.com/mmmihaeel/codez) | Codex-compatible runtime | App Server v2, goal RPC, long-session hardening, prompt pruning, and plugin hooks | Does not require Teledex |
-| [RTK Codex Plugin](https://github.com/mmmihaeel/rtk-codex-plugin) | Optional Codex plugin | Shell/token safety through `rtk rewrite` and bounded output guarding | Requires a Codex-compatible plugin-hook runtime; does not require Teledex |
-| [Pitlane Codex Plugin](https://github.com/mmmihaeel/pitlane-codex-plugin) | Optional Codex plugin | Code-navigation/token-saving rewrites through a host-local `pitlane` CLI | Requires a Codex-compatible plugin-hook runtime and local `pitlane`; does not require Teledex |
-| [Teledex](https://github.com/mmmihaeel/teledex) | Telegram gateway/session layer | Topics, queues, live steer, `/goal` UX, and delivery/recovery around durable agent sessions | Full mode is optimized for Codez App Server v2; upstream `codex exec --json` is legacy compatibility only |
+## Responsibilities
 
-The plugin does not own sessions, chat delivery, host registries, or project
-metadata. It only handles shell command rewrite and bounded output at the hook
-layer.
+| Project                                                                   | Owns                                                                                     | Does not own                                                            |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| [Codez](https://github.com/mmmihaeel/codez)                               | Agent runtime, tool policy, App Server, plugin execution                                 | RTK-specific classification or gateway delivery                         |
+| [RTK Codex Plugin](https://github.com/mmmihaeel/rtk-codex-plugin)         | Optional command rewrite adapter, bounded inspection wrapper, PostToolUse output budgets | Sandboxing, approvals, sessions, Telegram delivery, or RTK distribution |
+| [Pitlane Codex Plugin](https://github.com/mmmihaeel/pitlane-codex-plugin) | Optional indexed source-navigation rewrites                                              | General output budgeting or runtime policy                              |
+| [Teledex](https://github.com/mmmihaeel/teledex)                           | Telegram transport, session routing, queueing, and recovery                              | Runtime command policy or plugin implementation                         |
 
-## Plain Version
+## Dependency direction
 
-Codez runs the agent. RTK makes risky shell output safer and smaller. Pitlane
-makes routine code browsing smaller by replacing safe source reads with indexed
-CLI calls. Teledex is the Telegram/session gateway that can drive a runtime,
-but it is not part of the Codez runtime itself.
+- RTK Codex Plugin requires only a compatible hook runtime and Python 3.11+ on
+  POSIX.
+- Codez does not require RTK.
+- RTK does not require Pitlane or Teledex.
+- Teledex may provision plugins for workers, but gateway operation remains
+  outside this repository.
+- The optional `rtk` executable is a separate local dependency resolved from
+  `PATH`.
 
-RTK does not require Codez, Pitlane, or Teledex. Codez is linked because it has
-a clean public repository and is the recommended runtime when you want plugin
-hooks plus token-aware context behavior. Teledex is linked as the Codez-first
-Telegram gateway layer; it can install or sync RTK for workers, but RTK remains
-usable without any gateway.
+## Multi-plugin order
 
-## Plugin Order
+When both RTK and Pitlane are enabled, loading RTK before Pitlane is the
+recommended integration order:
 
-When RTK and Pitlane are both enabled, load RTK before Pitlane. RTK handles
-general shell-output safety; Pitlane then wins only for the narrow
-code-navigation commands it accepts.
+1. RTK handles its general command and output-budget responsibilities.
+2. Pitlane may claim the narrow indexed-navigation forms it recognizes.
+
+RTK classifier tests preserve documented Pitlane-owned navigation shapes, but
+this repository does not contain a cross-plugin end-to-end test. Treat the
+ordering as an integration recommendation, then verify it against the exact
+plugin releases installed.
+
+## Security boundary
+
+Every enabled hook is trusted local code. Plugins can inspect or alter tool
+input and output, but they do not replace Codez approvals, sandboxing, or host
+access control. See [Security](../SECURITY.md).
